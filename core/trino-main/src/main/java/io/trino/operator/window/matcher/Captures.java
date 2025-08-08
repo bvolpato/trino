@@ -13,11 +13,21 @@
  */
 package io.trino.operator.window.matcher;
 
+import io.trino.annotation.NotThreadSafe;
+
 import static io.airlift.slice.SizeOf.instanceSize;
 
-// TODO: optimize by
-//   - reference counting and copy on write
-//   - reuse allocated arrays
+/**
+ * Aggregates thread-local state used by the row pattern matcher.
+ * <p>
+ * Holds two {@link IntMultimap} instances:
+ * - captures: start/end indices delimiting excluded subsequences
+ * - labels: matched label IDs for each position in the input
+ * Both maps leverage copy-on-write to make thread forking inexpensive.
+ * <p>
+ * Not thread-safe.
+ */
+@NotThreadSafe
 class Captures
 {
     private static final int INSTANCE_SIZE = instanceSize(Captures.class);
