@@ -60,12 +60,11 @@ class IntMultimap
     {
         boolean expanded = ensureCapacity(key);
         long listSizeBefore;
-        if (expanded || values[key] == null)
-        {
+        if (expanded || values[key] == null) {
             listSizeBefore = 0L;
             values[key] = new IntList(listCapacity);
-        } else
-        {
+        }
+        else {
             listSizeBefore = values[key].getSizeInBytes();
         }
         values[key].add(value);
@@ -78,8 +77,7 @@ class IntMultimap
      */
     public void release(int key)
     {
-        if (values[key] != null)
-        {
+        if (key < values.length && values[key] != null) {
             long sizeBefore = values[key].getSizeInBytes();
             values[key].release();
             valuesSize -= sizeBefore;
@@ -95,20 +93,18 @@ class IntMultimap
     public void copy(int parent, int child)
     {
         boolean expanded = ensureCapacity(child);
-        if (expanded || values[child] == null)
-        {
-            if (values[parent] != null)
-            {
+        if (expanded || values[child] == null) {
+            if (values[parent] != null) {
                 values[child] = values[parent].copy();
                 valuesSize += values[child].getSizeInBytes();
             }
-        } else if (values[parent] != null)
-        {
+        }
+        else if (values[parent] != null) {
             long listSizeBefore = values[child].getSizeInBytes();
             values[child] = values[parent].copy();
             valuesSize += values[child].getSizeInBytes() - listSizeBefore;
-        } else
-        {
+        }
+        else {
             valuesSize -= values[child].getSizeInBytes();
             values[child] = null;
         }
@@ -120,8 +116,7 @@ class IntMultimap
      */
     public ArrayView getArrayView(int key)
     {
-        if (values[key] == null)
-        {
+        if (key >= values.length || values[key] == null) {
             return ArrayView.EMPTY;
         }
         return values[key].toArrayView();
@@ -135,10 +130,8 @@ class IntMultimap
     {
         // Reuse the existing array and clear references. Release lists to keep
         // copy-on-write reference counts correct for any shared backing data.
-        for (int i = 0; i < values.length; i++)
-        {
-            if (values[i] != null)
-            {
+        for (int i = 0; i < values.length; i++) {
+            if (values[i] != null) {
                 values[i].release();
                 values[i] = null;
             }
@@ -153,8 +146,7 @@ class IntMultimap
      */
     private boolean ensureCapacity(int key)
     {
-        if (key >= values.length)
-        {
+        if (key >= values.length) {
             values = Arrays.copyOf(values, Math.max(values.length * 2, key + 1));
             return true;
         }

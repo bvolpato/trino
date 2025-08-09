@@ -41,38 +41,61 @@ class Captures
         this.labels = new IntMultimap(initialCapacity, labelCount);
     }
 
+    /**
+     * Saves an exclusion/capture boundary for a given thread.
+     */
     public void save(int threadId, int value)
     {
         captures.add(threadId, value);
     }
 
+    /**
+     * Saves a matched label for a given thread.
+     */
     public void saveLabel(int threadId, int value)
     {
         labels.add(threadId, value);
     }
 
+    /**
+     * Copies per-thread state from {@code parent} to {@code child} (shares
+     * storage; copy-on-write on mutation).
+     */
     public void copy(int parent, int child)
     {
         captures.copy(parent, child);
         labels.copy(parent, child);
     }
 
+    /**
+     * Returns a view of capture boundaries for a thread.
+     */
     public ArrayView getCaptures(int threadId)
     {
         return captures.getArrayView(threadId);
     }
 
+    /**
+     * Returns a view of labels matched for a thread.
+     */
     public ArrayView getLabels(int threadId)
     {
         return labels.getArrayView(threadId);
     }
 
+    /**
+     * Releases per-thread state for a finished thread.
+     */
     public void release(int threadId)
     {
         captures.release(threadId);
         labels.release(threadId);
     }
 
+    /**
+     * Returns the estimated memory footprint of this structure and the maps it
+     * owns (excluding the program and equivalence structures).
+     */
     public long getSizeInBytes()
     {
         return INSTANCE_SIZE + captures.getSizeInBytes() + labels.getSizeInBytes();
