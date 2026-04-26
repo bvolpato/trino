@@ -20,6 +20,7 @@ import io.trino.Session;
 import io.trino.spi.type.VarcharType;
 import io.trino.sql.planner.plan.LimitNode;
 import io.trino.sql.planner.plan.TopNNode;
+import io.trino.sql.query.QueryAssertions;
 import io.trino.testing.AbstractTestQueries;
 import io.trino.testing.BaseConnectorTest;
 import io.trino.testing.MaterializedResult;
@@ -41,11 +42,9 @@ import java.util.Map;
 import java.util.stream.Stream;
 
 import static io.trino.spi.StandardErrorCode.INVALID_COLUMN_REFERENCE;
-import static io.trino.spi.type.BigintType.BIGINT;
 import static io.trino.spi.type.DoubleType.DOUBLE;
 import static io.trino.spi.type.VarcharType.VARCHAR;
 import static io.trino.testing.MaterializedResult.resultBuilder;
-import static io.trino.testing.QueryAssertions.assertEqualsIgnoreOrder;
 import static io.trino.testing.TestingNames.randomNameSuffix;
 import static io.trino.testing.assertions.TrinoExceptionAssert.assertTrinoExceptionThrownBy;
 import static java.lang.String.format;
@@ -206,6 +205,70 @@ public abstract class BaseElasticsearchConnectorTest
     }
 
     @Test
+    public void testTopNPushdownWithMultipleSortColumnsAndMissingValues()
+            throws IOException
+    {
+        String tableName = "test_topn_sorting_" + randomNameSuffix();
+        @Language("JSON")
+        String properties =
+                """
+                {
+                    "properties": {
+                        "id": {
+                            "type": "keyword"
+                        },
+                        "sort_key": {
+                            "type": "long"
+                        },
+                        "tie_key": {
+                            "type": "long"
+                        }
+                    }
+                }
+                """;
+
+        createIndex(tableName, properties);
+        try {
+            index(tableName, ImmutableMap.<String, Object>builder()
+                    .put("id", "1")
+                    .put("sort_key", 2)
+                    .put("tie_key", 10)
+                    .buildOrThrow());
+            index(tableName, ImmutableMap.<String, Object>builder()
+                    .put("id", "2")
+                    .put("tie_key", 90)
+                    .buildOrThrow());
+            index(tableName, ImmutableMap.<String, Object>builder()
+                    .put("id", "3")
+                    .put("sort_key", 1)
+                    .put("tie_key", 10)
+                    .buildOrThrow());
+            index(tableName, ImmutableMap.<String, Object>builder()
+                    .put("id", "4")
+                    .put("sort_key", 1)
+                    .put("tie_key", 20)
+                    .buildOrThrow());
+
+            String nullsFirstQuery = format("SELECT id, sort_key, tie_key FROM %s ORDER BY sort_key ASC NULLS FIRST, tie_key DESC LIMIT 3", tableName);
+            assertThat(query(nullsFirstQuery))
+                    .ordered()
+                    .matches("VALUES (CAST('2' AS VARCHAR), CAST(NULL AS BIGINT), BIGINT '90'), (CAST('4' AS VARCHAR), BIGINT '1', BIGINT '20'), (CAST('3' AS VARCHAR), BIGINT '1', BIGINT '10')")
+                    .isNotFullyPushedDown(TopNNode.class);
+            assertExplain(
+                    "EXPLAIN " + nullsFirstQuery,
+                    "TopNPartial\\[count = 3, orderBy = \\[sort_key ASC NULLS FIRST, tie_key DESC");
+
+            assertThat(query(format("SELECT id, sort_key, tie_key FROM %s ORDER BY sort_key DESC NULLS LAST, tie_key ASC LIMIT 3", tableName)))
+                    .ordered()
+                    .matches("VALUES (CAST('1' AS VARCHAR), BIGINT '2', BIGINT '10'), (CAST('3' AS VARCHAR), BIGINT '1', BIGINT '10'), (CAST('4' AS VARCHAR), BIGINT '1', BIGINT '20')")
+                    .isNotFullyPushedDown(TopNNode.class);
+        }
+        finally {
+            deleteIndex(tableName);
+        }
+    }
+
+    @Test
     @Override
     public void testLimitPushdown()
     {
@@ -264,22 +327,10 @@ public abstract class BaseElasticsearchConnectorTest
     public void testAggregationPaginationWithSmallPageSize()
             throws Exception
     {
-        try (QueryRunner queryRunner = createAdHocQueryRunner(Map.of("elasticsearch.aggregation-page-size", "2"))) {
-            MaterializedResult actual = queryRunner.execute("SELECT regionkey, nationkey % 2 AS parity, COUNT(*) FROM nation GROUP BY regionkey, nationkey % 2");
-            MaterializedResult expected = resultBuilder(queryRunner.getDefaultSession(), BIGINT, BIGINT, BIGINT)
-                    .row(0L, 0L, 3L)
-                    .row(0L, 1L, 2L)
-                    .row(1L, 0L, 2L)
-                    .row(1L, 1L, 3L)
-                    .row(2L, 0L, 3L)
-                    .row(2L, 1L, 2L)
-                    .row(3L, 0L, 2L)
-                    .row(3L, 1L, 3L)
-                    .row(4L, 0L, 3L)
-                    .row(4L, 1L, 2L)
-                    .build();
-
-            assertEqualsIgnoreOrder(actual, expected);
+        try (QueryAssertions assertions = new QueryAssertions(createAdHocQueryRunner(Map.of("elasticsearch.aggregation-page-size", "2")))) {
+            assertThat(assertions.query("SELECT regionkey, nationkey, COUNT(*) FROM nation GROUP BY regionkey, nationkey"))
+                    .matches("SELECT regionkey, nationkey, BIGINT '1' FROM nation")
+                    .isFullyPushedDown();
         }
     }
 
@@ -325,6 +376,52 @@ public abstract class BaseElasticsearchConnectorTest
         assertQuery(
                 "SELECT regionkey, COUNT(*), COUNT(name) FROM nation GROUP BY regionkey ORDER BY regionkey LIMIT 2",
                 "VALUES (0, 5, 5), (1, 5, 5)");
+    }
+
+    @Test
+    public void testAggregationWithMissingGroupingKeys()
+            throws IOException
+    {
+        String tableName = "test_aggregation_missing_grouping_keys_" + randomNameSuffix();
+        @Language("JSON")
+        String properties =
+                """
+                {
+                    "properties": {
+                        "group_key": {
+                            "type": "keyword"
+                        },
+                        "value": {
+                            "type": "long"
+                        }
+                    }
+                }
+                """;
+
+        createIndex(tableName, properties);
+        try {
+            index(tableName, ImmutableMap.<String, Object>builder()
+                    .put("group_key", "a")
+                    .put("value", 10)
+                    .buildOrThrow());
+            index(tableName, ImmutableMap.<String, Object>builder()
+                    .put("group_key", "a")
+                    .put("value", 20)
+                    .buildOrThrow());
+            index(tableName, ImmutableMap.<String, Object>builder()
+                    .put("group_key", "b")
+                    .put("value", 5)
+                    .buildOrThrow());
+            index(tableName, ImmutableMap.of("value", 7));
+            index(tableName, ImmutableMap.of("value", 8));
+
+            assertThat(query("SELECT group_key, COUNT(*), SUM(value) FROM " + tableName + " GROUP BY group_key"))
+                    .matches("VALUES (CAST(NULL AS VARCHAR), BIGINT '2', BIGINT '15'), (CAST('a' AS VARCHAR), BIGINT '2', BIGINT '30'), (CAST('b' AS VARCHAR), BIGINT '1', BIGINT '5')")
+                    .isFullyPushedDown();
+        }
+        finally {
+            deleteIndex(tableName);
+        }
     }
 
     @Test
