@@ -29,9 +29,20 @@ public record ElasticsearchColumnHandle(
         Type type,
         IndexMetadata.Type elasticsearchType,
         DecoderDescriptor decoderDescriptor,
-        boolean supportsPredicates)
+        boolean supportsPredicates,
+        boolean supportsTopNAndAggregations)
         implements ColumnHandle
 {
+    public ElasticsearchColumnHandle(
+            List<String> path,
+            Type type,
+            IndexMetadata.Type elasticsearchType,
+            DecoderDescriptor decoderDescriptor,
+            boolean supportsPredicates)
+    {
+        this(path, type, elasticsearchType, decoderDescriptor, supportsPredicates, true);
+    }
+
     public ElasticsearchColumnHandle
     {
         path = ImmutableList.copyOf(path);

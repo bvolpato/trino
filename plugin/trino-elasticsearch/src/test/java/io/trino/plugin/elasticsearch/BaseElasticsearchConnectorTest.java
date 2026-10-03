@@ -13,11 +13,17 @@
  */
 package io.trino.plugin.elasticsearch;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.json.JsonMapper;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import io.trino.Session;
 import io.trino.spi.type.VarcharType;
+import io.trino.sql.planner.plan.AggregationNode;
+import io.trino.sql.planner.plan.FilterNode;
+import io.trino.sql.planner.plan.LimitNode;
+import io.trino.sql.planner.plan.TopNNode;
+import io.trino.sql.query.QueryAssertions;
 import io.trino.testing.AbstractTestQueries;
 import io.trino.testing.BaseConnectorTest;
 import io.trino.testing.MaterializedResult;
@@ -98,15 +104,16 @@ public abstract class BaseElasticsearchConnectorTest
                  SUPPORTS_CREATE_VIEW,
                  SUPPORTS_DELETE,
                  SUPPORTS_INSERT,
-                 SUPPORTS_LIMIT_PUSHDOWN,
                  SUPPORTS_MERGE,
                  SUPPORTS_RENAME_COLUMN,
                  SUPPORTS_RENAME_TABLE,
                  SUPPORTS_ROW_TYPE,
                  SUPPORTS_SET_COLUMN_TYPE,
-                 SUPPORTS_TOPN_PUSHDOWN,
                  SUPPORTS_UPDATE -> false;
-            case SUPPORTS_DEREFERENCE_PUSHDOWN -> true;
+            case SUPPORTS_DEREFERENCE_PUSHDOWN,
+                 SUPPORTS_LIMIT_PUSHDOWN,
+                 SUPPORTS_TOPN_PUSHDOWN,
+                 SUPPORTS_AGGREGATION_PUSHDOWN -> true;
             default -> super.hasBehavior(connectorBehavior);
         };
     }
@@ -190,6 +197,899 @@ public abstract class BaseElasticsearchConnectorTest
 
     @Test
     @Override
+    public void testTopNPushdown()
+    {
+        assertThat(query("SELECT nationkey FROM nation ORDER BY nationkey DESC LIMIT 5"))
+                .ordered()
+                .matches("VALUES BIGINT '24', BIGINT '23', BIGINT '22', BIGINT '21', BIGINT '20'")
+                .isNotFullyPushedDown(TopNNode.class);
+        assertExplain(
+                "EXPLAIN SELECT nationkey FROM nation ORDER BY nationkey DESC LIMIT 5",
+                "TopNPartial\\[count = 5, orderBy = \\[nationkey DESC");
+    }
+
+    @Test
+    public void testTopNPushdownWithMultipleSortColumnsAndMissingValues()
+            throws IOException
+    {
+        String tableName = "test_topn_sorting_" + randomNameSuffix();
+        @Language("JSON")
+        String properties =
+                """
+                {
+                    "properties": {
+                        "id": {
+                            "type": "keyword"
+                        },
+                        "sort_key": {
+                            "type": "long"
+                        },
+                        "tie_key": {
+                            "type": "long"
+                        }
+                    }
+                }
+                """;
+
+        createIndex(tableName, properties);
+        try {
+            index(tableName, ImmutableMap.<String, Object>builder()
+                    .put("id", "1")
+                    .put("sort_key", 2)
+                    .put("tie_key", 10)
+                    .buildOrThrow());
+            index(tableName, ImmutableMap.<String, Object>builder()
+                    .put("id", "2")
+                    .put("tie_key", 90)
+                    .buildOrThrow());
+            index(tableName, ImmutableMap.<String, Object>builder()
+                    .put("id", "3")
+                    .put("sort_key", 1)
+                    .put("tie_key", 10)
+                    .buildOrThrow());
+            index(tableName, ImmutableMap.<String, Object>builder()
+                    .put("id", "4")
+                    .put("sort_key", 1)
+                    .put("tie_key", 20)
+                    .buildOrThrow());
+
+            String nullsFirstQuery = format("SELECT id, sort_key, tie_key FROM %s ORDER BY sort_key ASC NULLS FIRST, tie_key DESC LIMIT 3", tableName);
+            assertThat(query(nullsFirstQuery))
+                    .ordered()
+                    .matches("VALUES (CAST('2' AS VARCHAR), CAST(NULL AS BIGINT), BIGINT '90'), (CAST('4' AS VARCHAR), BIGINT '1', BIGINT '20'), (CAST('3' AS VARCHAR), BIGINT '1', BIGINT '10')")
+                    .isNotFullyPushedDown(TopNNode.class);
+            assertExplain(
+                    "EXPLAIN " + nullsFirstQuery,
+                    "TopNPartial\\[count = 3, orderBy = \\[sort_key ASC NULLS FIRST, tie_key DESC");
+
+            assertThat(query(format("SELECT id, sort_key, tie_key FROM %s ORDER BY sort_key DESC NULLS LAST, tie_key ASC LIMIT 3", tableName)))
+                    .ordered()
+                    .matches("VALUES (CAST('1' AS VARCHAR), BIGINT '2', BIGINT '10'), (CAST('3' AS VARCHAR), BIGINT '1', BIGINT '10'), (CAST('4' AS VARCHAR), BIGINT '1', BIGINT '20')")
+                    .isNotFullyPushedDown(TopNNode.class);
+        }
+        finally {
+            deleteIndex(tableName);
+        }
+    }
+
+    @Test
+    @Override
+    public void testLimitPushdown()
+    {
+        assertQuery("SELECT count(*) FROM (SELECT nationkey FROM nation LIMIT 5)", "VALUES 5");
+        assertThat(query("SELECT nationkey FROM nation LIMIT 5"))
+                .isNotFullyPushedDown(LimitNode.class);
+        assertExplain(
+                "EXPLAIN SELECT nationkey FROM nation LIMIT 5",
+                "LimitPartial\\[count = 5");
+    }
+
+    @Test
+    public void testCountStarPushdown()
+    {
+        assertThat(query("SELECT COUNT(*) FROM nation"))
+                .matches("VALUES BIGINT '25'")
+                .isFullyPushedDown();
+        assertThat(query("SELECT COUNT(*), SUM(nationkey) FROM nation"))
+                .matches("VALUES (BIGINT '25', BIGINT '300')")
+                .isNotFullyPushedDown(AggregationNode.class);
+        assertThat(query("SELECT regionkey, COUNT(*) FROM nation GROUP BY regionkey"))
+                .isFullyPushedDown();
+
+        // Simple COUNT(*)
+        assertQuery("SELECT COUNT(*) FROM nation", "SELECT 25");
+
+        // COUNT(*) with WHERE clause
+        assertQuery("SELECT COUNT(*) FROM nation WHERE regionkey = 1", "SELECT 5");
+
+        // COUNT(*) with other aggregations (global) - ensure COUNT(*) isn't lost
+        assertQuery("SELECT COUNT(*), MIN(nationkey), MAX(nationkey) FROM nation", "VALUES (25, 0, 24)");
+        assertQuery("SELECT COUNT(*), SUM(nationkey) FROM nation", "VALUES (25, 300)");
+
+        // COUNT(*) with GROUP BY - this should be pushed down
+        assertQuery(
+                "SELECT regionkey, COUNT(*) FROM nation GROUP BY regionkey ORDER BY regionkey",
+                "VALUES (0, 5), (1, 5), (2, 5), (3, 5), (4, 5)");
+
+        // COUNT(*) with GROUP BY and LIMIT
+        assertQuery(
+                "SELECT regionkey, COUNT(*) FROM nation GROUP BY regionkey ORDER BY regionkey LIMIT 2",
+                "VALUES (0, 5), (1, 5)");
+
+        // COUNT(*) vs COUNT(column) - both should be pushed down
+        assertQuery(
+                "SELECT regionkey, COUNT(*), COUNT(nationkey) FROM nation GROUP BY regionkey ORDER BY regionkey",
+                "VALUES (0, 5, 5), (1, 5, 5), (2, 5, 5), (3, 5, 5), (4, 5, 5)");
+
+        // Multiple aggregations with COUNT(*)
+        assertQuery(
+                "SELECT regionkey, COUNT(*), MIN(nationkey), MAX(nationkey) FROM nation GROUP BY regionkey ORDER BY regionkey",
+                "VALUES (0, 5, 0, 16), (1, 5, 1, 24), (2, 5, 8, 21), (3, 5, 6, 23), (4, 5, 4, 20)");
+    }
+
+    @Test
+    public void testCountStarWithDoubleSumPushdown()
+            throws IOException
+    {
+        String tableName = "count_star_double_sum_" + randomNameSuffix();
+        createIndex(tableName,
+                """
+                {"properties": {"group_key": {"type": "keyword"}, "value": {"type": "double"}}}
+                """);
+        try {
+            index(tableName, ImmutableMap.of("group_key", "a", "value", 1.25));
+            index(tableName, ImmutableMap.of("group_key", "a", "value", 2.5));
+            index(tableName, ImmutableMap.of("group_key", "b", "value", 3.0));
+
+            assertThat(query("SELECT COUNT(*), SUM(value) FROM " + tableName))
+                    .matches("VALUES (BIGINT '3', DOUBLE '6.75')")
+                    .isFullyPushedDown();
+            assertThat(query("SELECT group_key, COUNT(*), SUM(value) FROM " + tableName + " GROUP BY group_key"))
+                    .matches("VALUES (VARCHAR 'a', BIGINT '2', DOUBLE '3.75'), (VARCHAR 'b', BIGINT '1', DOUBLE '3.0')")
+                    .isFullyPushedDown();
+        }
+        finally {
+            deleteIndex(tableName);
+        }
+    }
+
+    @Test
+    public void testTopNAndAggregationSkipFieldsWithDocValuesDifferentFromSource()
+            throws IOException
+    {
+        String tableName = "doc_values_source_mismatch_" + randomNameSuffix();
+        createIndexWithBody(tableName,
+                """
+                {
+                    "settings": {
+                        "analysis": {
+                            "normalizer": {
+                                "lowercase_normalizer": {
+                                    "type": "custom",
+                                    "filter": ["lowercase"]
+                                }
+                            }
+                        }
+                    },
+                    "mappings": {
+                        "_meta": {
+                            "trino": {
+                                "raw_keyword": {"asRawJson": true}
+                            }
+                        },
+                        "properties": {
+                            "d": {"type": "double", "doc_values": false},
+                            "no_doc_values_keyword": {"type": "keyword", "doc_values": false},
+                            "limited_keyword": {"type": "keyword", "ignore_above": 3},
+                            "normalized_keyword": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+                            "null_keyword": {"type": "keyword", "null_value": "unknown"},
+                            "raw_keyword": {"type": "keyword"}
+                        }
+                    }
+                }
+                """);
+        try {
+            index(tableName, ImmutableMap.of(
+                    "d", 2.5,
+                    "no_doc_values_keyword", "a",
+                    "limited_keyword", "ab",
+                    "normalized_keyword", "Abc",
+                    "null_keyword", "present",
+                    "raw_keyword", "Abc"));
+            index(tableName, ImmutableMap.of(
+                    "d", 1.5,
+                    "no_doc_values_keyword", "b",
+                    "limited_keyword", "abcdef",
+                    "normalized_keyword", "abc",
+                    "raw_keyword", "abc"));
+            Map<String, Object> documentWithNull = new HashMap<>();
+            documentWithNull.put("d", 3.0);
+            documentWithNull.put("no_doc_values_keyword", "c");
+            documentWithNull.put("limited_keyword", "zzzzzz");
+            documentWithNull.put("normalized_keyword", "Zed");
+            documentWithNull.put("null_keyword", null);
+            documentWithNull.put("raw_keyword", "Zed");
+            index(tableName, documentWithNull);
+
+            Session withoutPushdown = Session.builder(getSession())
+                    .setSystemProperty("allow_pushdown_into_connectors", "false")
+                    .build();
+
+            String doubleTopN = "SELECT d FROM " + tableName + " ORDER BY d DESC LIMIT 1";
+            assertThat(query(doubleTopN))
+                    .matches("VALUES DOUBLE '3.0'")
+                    .isNotFullyPushedDown(TopNNode.class);
+            assertThat(query(withoutPushdown, doubleTopN)).matches("VALUES DOUBLE '3.0'");
+
+            String keywordGrouping = "SELECT no_doc_values_keyword, count(*) FROM " + tableName + " GROUP BY no_doc_values_keyword";
+            assertThat(query(keywordGrouping))
+                    .matches("VALUES (VARCHAR 'a', BIGINT '1'), (VARCHAR 'b', BIGINT '1'), (VARCHAR 'c', BIGINT '1')")
+                    .isNotFullyPushedDown(AggregationNode.class);
+            assertThat(query(withoutPushdown, keywordGrouping))
+                    .matches("VALUES (VARCHAR 'a', BIGINT '1'), (VARCHAR 'b', BIGINT '1'), (VARCHAR 'c', BIGINT '1')");
+
+            String keywordCount = "SELECT count(no_doc_values_keyword) FROM " + tableName;
+            assertThat(query(keywordCount))
+                    .matches("VALUES BIGINT '3'")
+                    .isNotFullyPushedDown(AggregationNode.class);
+            assertThat(query(withoutPushdown, keywordCount)).matches("VALUES BIGINT '3'");
+
+            String limitedCount = "SELECT count(limited_keyword) FROM " + tableName;
+            assertThat(query(limitedCount))
+                    .matches("VALUES BIGINT '3'")
+                    .isNotFullyPushedDown(AggregationNode.class);
+            assertThat(query(withoutPushdown, limitedCount)).matches("VALUES BIGINT '3'");
+
+            String limitedTopN = "SELECT limited_keyword FROM " + tableName + " ORDER BY limited_keyword DESC LIMIT 1";
+            assertThat(query(limitedTopN))
+                    .matches("VALUES VARCHAR 'zzzzzz'")
+                    .isNotFullyPushedDown(TopNNode.class);
+            assertThat(query(withoutPushdown, limitedTopN)).matches("VALUES VARCHAR 'zzzzzz'");
+
+            String normalizedGrouping = "SELECT normalized_keyword, count(*) FROM " + tableName + " GROUP BY normalized_keyword";
+            assertThat(query(normalizedGrouping))
+                    .matches("VALUES (VARCHAR 'Abc', BIGINT '1'), (VARCHAR 'abc', BIGINT '1'), (VARCHAR 'Zed', BIGINT '1')")
+                    .isNotFullyPushedDown(AggregationNode.class);
+            assertThat(query(withoutPushdown, normalizedGrouping))
+                    .matches("VALUES (VARCHAR 'Abc', BIGINT '1'), (VARCHAR 'abc', BIGINT '1'), (VARCHAR 'Zed', BIGINT '1')");
+
+            String normalizedTopN = "SELECT normalized_keyword FROM " + tableName + " ORDER BY normalized_keyword DESC LIMIT 1";
+            assertThat(query(normalizedTopN))
+                    .matches("VALUES VARCHAR 'abc'")
+                    .isNotFullyPushedDown(TopNNode.class);
+            assertThat(query(withoutPushdown, normalizedTopN)).matches("VALUES VARCHAR 'abc'");
+
+            String nullValueCount = "SELECT count(null_keyword) FROM " + tableName;
+            assertThat(query(nullValueCount))
+                    .matches("VALUES BIGINT '1'")
+                    .isNotFullyPushedDown(AggregationNode.class);
+            assertThat(query(withoutPushdown, nullValueCount)).matches("VALUES BIGINT '1'");
+
+            String rawJsonGrouping = "SELECT raw_keyword, count(*) FROM " + tableName + " GROUP BY raw_keyword";
+            assertThat(query(rawJsonGrouping))
+                    .matches("VALUES (VARCHAR '\"Abc\"', BIGINT '1'), (VARCHAR '\"abc\"', BIGINT '1'), (VARCHAR '\"Zed\"', BIGINT '1')")
+                    .isNotFullyPushedDown(AggregationNode.class);
+            assertThat(query(withoutPushdown, rawJsonGrouping))
+                    .matches("VALUES (VARCHAR '\"Abc\"', BIGINT '1'), (VARCHAR '\"abc\"', BIGINT '1'), (VARCHAR '\"Zed\"', BIGINT '1')");
+
+            Map<String, String> predicateQueries = ImmutableMap.<String, String>builder()
+                    .put("SELECT normalized_keyword FROM %s WHERE normalized_keyword = 'abc'", "VALUES VARCHAR 'abc'")
+                    .put("SELECT normalized_keyword FROM %s WHERE normalized_keyword LIKE 'Ab%%'", "VALUES VARCHAR 'Abc'")
+                    .put("SELECT limited_keyword FROM %s WHERE limited_keyword = 'abcdef'", "VALUES VARCHAR 'abcdef'")
+                    .put("SELECT limited_keyword FROM %s WHERE limited_keyword IS NULL", "SELECT CAST(NULL AS VARCHAR) WHERE false")
+                    .put("SELECT null_keyword FROM %s WHERE null_keyword IS NULL", "VALUES CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR)")
+                    .put("SELECT null_keyword FROM %s WHERE null_keyword = 'unknown'", "SELECT CAST(NULL AS VARCHAR) WHERE false")
+                    .put("SELECT raw_keyword FROM %s WHERE raw_keyword = '\"Abc\"'", "VALUES VARCHAR '\"Abc\"'")
+                    .buildOrThrow();
+            for (Map.Entry<String, String> predicateQuery : predicateQueries.entrySet()) {
+                String sql = format(predicateQuery.getKey(), tableName);
+                assertThat(query(sql))
+                        .matches(predicateQuery.getValue())
+                        .isNotFullyPushedDown(FilterNode.class);
+                assertThat(query(withoutPushdown, sql)).matches(predicateQuery.getValue());
+            }
+
+            assertThat(query("SELECT no_doc_values_keyword FROM " + tableName + " WHERE no_doc_values_keyword = 'a'"))
+                    .matches("VALUES VARCHAR 'a'")
+                    .isFullyPushedDown();
+        }
+        finally {
+            deleteIndex(tableName);
+        }
+    }
+
+    @Test
+    public void testTopNAndAggregationSkipScriptedAndSourceMismatchedFields()
+            throws IOException
+    {
+        Session withoutPushdown = Session.builder(getSession())
+                .setSystemProperty("allow_pushdown_into_connectors", "false")
+                .build();
+
+        String scriptedTable = "scripted_mapping_safety_" + randomNameSuffix();
+        createIndexWithBody(scriptedTable,
+                """
+                {
+                    "mappings": {
+                        "properties": {
+                            "base": {"type": "long"},
+                            "scripted_long": {"type": "long", "script": {"source": "emit(doc['base'].value)"}},
+                            "scripted_double": {"type": "double", "script": {"source": "emit(doc['base'].value * 1.5)"}}
+                        }
+                    }
+                }
+                """);
+        try {
+            index(scriptedTable, ImmutableMap.of("base", 10));
+            index(scriptedTable, ImmutableMap.of("base", 20));
+
+            String scriptedLongCount = "SELECT count(scripted_long) FROM " + scriptedTable;
+            assertThat(query(scriptedLongCount))
+                    .matches("VALUES BIGINT '0'")
+                    .isNotFullyPushedDown(AggregationNode.class);
+            assertThat(query(withoutPushdown, scriptedLongCount)).matches("VALUES BIGINT '0'");
+
+            String scriptedLongGrouping = "SELECT scripted_long, count(*) FROM " + scriptedTable + " GROUP BY scripted_long";
+            assertThat(query(scriptedLongGrouping))
+                    .matches("VALUES (CAST(NULL AS BIGINT), BIGINT '2')")
+                    .isNotFullyPushedDown(AggregationNode.class);
+            assertThat(query(withoutPushdown, scriptedLongGrouping)).matches("VALUES (CAST(NULL AS BIGINT), BIGINT '2')");
+
+            String scriptedDoubleCount = "SELECT count(scripted_double) FROM " + scriptedTable;
+            assertThat(query(scriptedDoubleCount))
+                    .matches("VALUES BIGINT '0'")
+                    .isNotFullyPushedDown(AggregationNode.class);
+            assertThat(query(withoutPushdown, scriptedDoubleCount)).matches("VALUES BIGINT '0'");
+
+            String scriptedDoubleGrouping = "SELECT scripted_double, count(*) FROM " + scriptedTable + " GROUP BY scripted_double";
+            assertThat(query(scriptedDoubleGrouping))
+                    .matches("VALUES (CAST(NULL AS DOUBLE), BIGINT '2')")
+                    .isNotFullyPushedDown(AggregationNode.class);
+            assertThat(query(withoutPushdown, scriptedDoubleGrouping)).matches("VALUES (CAST(NULL AS DOUBLE), BIGINT '2')");
+
+            String scriptedPredicate = "SELECT base FROM " + scriptedTable + " WHERE scripted_long IS NULL AND scripted_double IS NULL";
+            assertThat(query(scriptedPredicate))
+                    .matches("VALUES BIGINT '10', BIGINT '20'")
+                    .isNotFullyPushedDown(FilterNode.class);
+            assertThat(query(withoutPushdown, scriptedPredicate)).matches("VALUES BIGINT '10', BIGINT '20'");
+
+            assertThat(query("SELECT count(*) FROM " + scriptedTable))
+                    .matches("VALUES BIGINT '2'")
+                    .isFullyPushedDown();
+        }
+        finally {
+            deleteIndex(scriptedTable);
+        }
+
+        String copyToTable = "copy_to_mapping_safety_" + randomNameSuffix();
+        createIndexWithBody(copyToTable,
+                """
+                {
+                    "mappings": {
+                        "properties": {
+                            "source_keyword": {"type": "keyword", "copy_to": "target_keyword"},
+                            "target_keyword": {"type": "keyword"}
+                        }
+                    }
+                }
+                """);
+        try {
+            index(copyToTable, ImmutableMap.of("source_keyword", "first"));
+            index(copyToTable, ImmutableMap.of("source_keyword", "second"));
+
+            String targetCount = "SELECT count(target_keyword) FROM " + copyToTable;
+            assertThat(query(targetCount))
+                    .matches("VALUES BIGINT '0'")
+                    .isNotFullyPushedDown(AggregationNode.class);
+            assertThat(query(withoutPushdown, targetCount)).matches("VALUES BIGINT '0'");
+
+            String targetGrouping = "SELECT target_keyword, count(*) FROM " + copyToTable + " GROUP BY target_keyword";
+            assertThat(query(targetGrouping))
+                    .matches("VALUES (CAST(NULL AS VARCHAR), BIGINT '2')")
+                    .isNotFullyPushedDown(AggregationNode.class);
+            assertThat(query(withoutPushdown, targetGrouping)).matches("VALUES (CAST(NULL AS VARCHAR), BIGINT '2')");
+
+            String copiedPredicate = "SELECT source_keyword FROM " + copyToTable + " WHERE target_keyword IS NULL";
+            assertThat(query(copiedPredicate))
+                    .matches("VALUES VARCHAR 'first', VARCHAR 'second'")
+                    .isNotFullyPushedDown(FilterNode.class);
+            assertThat(query(withoutPushdown, copiedPredicate)).matches("VALUES VARCHAR 'first', VARCHAR 'second'");
+
+            String copiedLike = "SELECT source_keyword FROM " + copyToTable + " WHERE target_keyword LIKE 'fi%'";
+            assertThat(query(copiedLike))
+                    .matches("SELECT CAST(NULL AS VARCHAR) WHERE false")
+                    .isNotFullyPushedDown(FilterNode.class);
+            assertThat(query(withoutPushdown, copiedLike)).matches("SELECT CAST(NULL AS VARCHAR) WHERE false");
+
+            assertThat(query("SELECT count(*) FROM " + copyToTable))
+                    .matches("VALUES BIGINT '2'")
+                    .isFullyPushedDown();
+        }
+        finally {
+            deleteIndex(copyToTable);
+        }
+
+        String sourceExcludesTable = "source_excludes_mapping_safety_" + randomNameSuffix();
+        createIndexWithBody(sourceExcludesTable,
+                """
+                {
+                    "mappings": {
+                        "_source": {"excludes": ["excluded_keyword"]},
+                        "properties": {
+                            "excluded_keyword": {"type": "keyword"}
+                        }
+                    }
+                }
+                """);
+        try {
+            index(sourceExcludesTable, ImmutableMap.of("excluded_keyword", "first"));
+            index(sourceExcludesTable, ImmutableMap.of("excluded_keyword", "second"));
+
+            String excludedCount = "SELECT count(excluded_keyword) FROM " + sourceExcludesTable;
+            assertThat(query(excludedCount))
+                    .matches("VALUES BIGINT '0'")
+                    .isNotFullyPushedDown(AggregationNode.class);
+            assertThat(query(withoutPushdown, excludedCount)).matches("VALUES BIGINT '0'");
+
+            String excludedGrouping = "SELECT excluded_keyword, count(*) FROM " + sourceExcludesTable + " GROUP BY excluded_keyword";
+            assertThat(query(excludedGrouping))
+                    .matches("VALUES (CAST(NULL AS VARCHAR), BIGINT '2')")
+                    .isNotFullyPushedDown(AggregationNode.class);
+            assertThat(query(withoutPushdown, excludedGrouping)).matches("VALUES (CAST(NULL AS VARCHAR), BIGINT '2')");
+
+            String excludedPredicate = "SELECT excluded_keyword FROM " + sourceExcludesTable + " WHERE excluded_keyword IS NULL";
+            assertThat(query(excludedPredicate))
+                    .matches("VALUES CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR)")
+                    .isNotFullyPushedDown(FilterNode.class);
+            assertThat(query(withoutPushdown, excludedPredicate)).matches("VALUES CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR)");
+
+            assertThat(query("SELECT count(*) FROM " + sourceExcludesTable))
+                    .matches("VALUES BIGINT '2'")
+                    .isFullyPushedDown();
+        }
+        finally {
+            deleteIndex(sourceExcludesTable);
+        }
+    }
+
+    @Test
+    public void testTopNAndAggregationSkipNestedOrDisabledFieldsAndPreserveProjectedMapping()
+            throws IOException
+    {
+        String tableName = "nested_aggregation_mapping_safety_" + randomNameSuffix();
+        createIndexWithBody(tableName,
+                """
+                {
+                    "settings": {
+                        "analysis": {
+                            "normalizer": {
+                                "lowercase_normalizer": {
+                                    "type": "custom",
+                                    "filter": ["lowercase"]
+                                }
+                            }
+                        }
+                    },
+                    "mappings": {
+                        "properties": {
+                            "row": {
+                                "properties": {
+                                    "a_unsupported": {"type": "half_float"},
+                                    "safe_keyword": {"type": "keyword"},
+                                    "unsafe_keyword": {"type": "keyword", "normalizer": "lowercase_normalizer"}
+                                }
+                            },
+                            "nested_object": {
+                                "type": "nested",
+                                "properties": {"key": {"type": "keyword"}}
+                            },
+                            "disabled_object": {
+                                "type": "object",
+                                "enabled": false,
+                                "properties": {"key": {"type": "keyword"}}
+                            }
+                        }
+                    }
+                }
+                """);
+        try {
+            index(tableName, ImmutableMap.of(
+                    "row", ImmutableMap.of("a_unsupported", 1.0, "safe_keyword", "safe", "unsafe_keyword", "Abc"),
+                    "nested_object", ImmutableMap.of("key", "a"),
+                    "disabled_object", ImmutableMap.of("key", "a")));
+            index(tableName, ImmutableMap.of(
+                    "row", ImmutableMap.of("a_unsupported", 2.0, "safe_keyword", "safe", "unsafe_keyword", "abc"),
+                    "nested_object", ImmutableMap.of("key", "b"),
+                    "disabled_object", ImmutableMap.of("key", "b")));
+            index(tableName, ImmutableMap.of(
+                    "row", ImmutableMap.of("a_unsupported", 3.0, "safe_keyword", "safe", "unsafe_keyword", "Zed"),
+                    "nested_object", ImmutableMap.of("key", "a"),
+                    "disabled_object", ImmutableMap.of("key", "a")));
+
+            Session withoutPushdown = Session.builder(getSession())
+                    .setSystemProperty("allow_pushdown_into_connectors", "false")
+                    .build();
+
+            String projectedGrouping = "SELECT row.unsafe_keyword, count(*) FROM " + tableName + " GROUP BY row.unsafe_keyword";
+            assertThat(query(projectedGrouping))
+                    .matches("VALUES (VARCHAR 'Abc', BIGINT '1'), (VARCHAR 'abc', BIGINT '1'), (VARCHAR 'Zed', BIGINT '1')")
+                    .isNotFullyPushedDown(AggregationNode.class);
+            assertThat(query(withoutPushdown, projectedGrouping))
+                    .matches("VALUES (VARCHAR 'Abc', BIGINT '1'), (VARCHAR 'abc', BIGINT '1'), (VARCHAR 'Zed', BIGINT '1')");
+
+            String projectedTopN = "SELECT row.unsafe_keyword FROM " + tableName + " ORDER BY row.unsafe_keyword DESC LIMIT 1";
+            assertThat(query(projectedTopN))
+                    .matches("VALUES VARCHAR 'abc'")
+                    .isNotFullyPushedDown(TopNNode.class);
+            assertThat(query(withoutPushdown, projectedTopN)).matches("VALUES VARCHAR 'abc'");
+
+            String nestedGrouping = "SELECT nested_object.key, count(*) FROM " + tableName + " GROUP BY nested_object.key";
+            assertThat(query(nestedGrouping))
+                    .matches("VALUES (VARCHAR 'a', BIGINT '2'), (VARCHAR 'b', BIGINT '1')")
+                    .isNotFullyPushedDown(AggregationNode.class);
+            assertThat(query(withoutPushdown, nestedGrouping))
+                    .matches("VALUES (VARCHAR 'a', BIGINT '2'), (VARCHAR 'b', BIGINT '1')");
+
+            String nestedTopN = "SELECT nested_object.key FROM " + tableName + " ORDER BY nested_object.key DESC LIMIT 1";
+            assertThat(query(nestedTopN))
+                    .matches("VALUES VARCHAR 'b'")
+                    .isNotFullyPushedDown(TopNNode.class);
+            assertThat(query(withoutPushdown, nestedTopN)).matches("VALUES VARCHAR 'b'");
+
+            String disabledGrouping = "SELECT disabled_object.key, count(*) FROM " + tableName + " GROUP BY disabled_object.key";
+            assertThat(query(disabledGrouping))
+                    .matches("VALUES (VARCHAR 'a', BIGINT '2'), (VARCHAR 'b', BIGINT '1')")
+                    .isNotFullyPushedDown(AggregationNode.class);
+            assertThat(query(withoutPushdown, disabledGrouping))
+                    .matches("VALUES (VARCHAR 'a', BIGINT '2'), (VARCHAR 'b', BIGINT '1')");
+
+            String disabledTopN = "SELECT disabled_object.key FROM " + tableName + " ORDER BY disabled_object.key DESC LIMIT 1";
+            assertThat(query(disabledTopN))
+                    .matches("VALUES VARCHAR 'b'")
+                    .isNotFullyPushedDown(TopNNode.class);
+            assertThat(query(withoutPushdown, disabledTopN)).matches("VALUES VARCHAR 'b'");
+
+            for (String predicate : List.of("row.unsafe_keyword = 'abc'", "row.unsafe_keyword LIKE 'ab%'", "nested_object.key = 'b'", "disabled_object.key = 'b'")) {
+                String predicateQuery = "SELECT row.unsafe_keyword FROM " + tableName + " WHERE " + predicate;
+                assertThat(query(predicateQuery))
+                        .matches("VALUES VARCHAR 'abc'")
+                        .isNotFullyPushedDown(FilterNode.class);
+                assertThat(query(withoutPushdown, predicateQuery)).matches("VALUES VARCHAR 'abc'");
+            }
+
+            assertThat(query("SELECT row.safe_keyword FROM " + tableName + " WHERE row.safe_keyword = 'safe'"))
+                    .matches("VALUES VARCHAR 'safe', VARCHAR 'safe', VARCHAR 'safe'")
+                    .isFullyPushedDown();
+        }
+        finally {
+            deleteIndex(tableName);
+        }
+    }
+
+    @Test
+    public void testTopNAndAggregationRequireCompatibleMappingsAcrossAlias()
+            throws IOException
+    {
+        String suffix = randomNameSuffix();
+        String firstIndex = "mapping_alias_a_" + suffix;
+        String secondIndex = "mapping_alias_b_" + suffix;
+        String alias = "mapping_alias_" + suffix;
+        createIndex(firstIndex,
+                """
+                {
+                    "dynamic": false,
+                    "properties": {
+                        "key": {"type": "keyword"},
+                        "first_only": {"type": "keyword"}
+                    }
+                }
+                """);
+        createIndexWithBody(secondIndex,
+                """
+                {
+                    "settings": {
+                        "analysis": {
+                            "normalizer": {
+                                "lowercase_normalizer": {
+                                    "type": "custom",
+                                    "filter": ["lowercase"]
+                                }
+                            }
+                        }
+                    },
+                    "mappings": {
+                        "dynamic": false,
+                        "properties": {
+                            "key": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+                            "second_only": {"type": "keyword"}
+                        }
+                    }
+                }
+                """);
+        try {
+            index(firstIndex, ImmutableMap.of("key", "abc", "first_only", "x", "second_only", "x"));
+            index(secondIndex, ImmutableMap.of("key", "Zed", "first_only", "zzz", "second_only", "zzz"));
+            addAlias(firstIndex, alias);
+            addAlias(secondIndex, alias);
+
+            Session withoutPushdown = Session.builder(getSession())
+                    .setSystemProperty("allow_pushdown_into_connectors", "false")
+                    .build();
+
+            assertThat(query("SELECT count(*) FROM " + alias))
+                    .matches("VALUES BIGINT '2'")
+                    .isFullyPushedDown();
+
+            String grouping = "SELECT key, count(*) FROM " + alias + " GROUP BY key";
+            assertThat(query(grouping))
+                    .matches("VALUES (VARCHAR 'abc', BIGINT '1'), (VARCHAR 'Zed', BIGINT '1')")
+                    .isNotFullyPushedDown(AggregationNode.class);
+            assertThat(query(withoutPushdown, grouping))
+                    .matches("VALUES (VARCHAR 'abc', BIGINT '1'), (VARCHAR 'Zed', BIGINT '1')");
+
+            String exclusiveColumn = computeActual("SHOW COLUMNS FROM " + alias).getMaterializedRows().stream()
+                    .map(row -> (String) row.getField(0))
+                    .filter(name -> name.equals("first_only") || name.equals("second_only"))
+                    .findFirst()
+                    .orElseThrow();
+            String topN = format("SELECT %s FROM %s ORDER BY %s DESC NULLS LAST LIMIT 1", exclusiveColumn, alias, exclusiveColumn);
+            assertThat(query(topN))
+                    .matches("VALUES VARCHAR 'zzz'")
+                    .isNotFullyPushedDown(TopNNode.class);
+            assertThat(query(withoutPushdown, topN)).matches("VALUES VARCHAR 'zzz'");
+
+            String aliasPredicate = "SELECT key FROM " + alias + " WHERE key = 'zed'";
+            assertThat(query(aliasPredicate))
+                    .matches("SELECT CAST(NULL AS VARCHAR) WHERE false")
+                    .isNotFullyPushedDown(FilterNode.class);
+            assertThat(query(withoutPushdown, aliasPredicate)).matches("SELECT CAST(NULL AS VARCHAR) WHERE false");
+        }
+        finally {
+            deleteIndex(firstIndex);
+            deleteIndex(secondIndex);
+        }
+    }
+
+    @Test
+    public void testAggregationPaginationWithSmallPageSize()
+            throws Exception
+    {
+        try (QueryAssertions assertions = new QueryAssertions(createAdHocQueryRunner(Map.of("elasticsearch.aggregation-page-size", "2")))) {
+            assertThat(assertions.query("SELECT regionkey, nationkey, COUNT(*) FROM nation GROUP BY regionkey, nationkey"))
+                    .matches("SELECT regionkey, nationkey, BIGINT '1' FROM nation")
+                    .isFullyPushedDown();
+        }
+    }
+
+    @Test
+    public void testCountStarWithMultipleGroupingColumns()
+    {
+        // COUNT(*) with multiple GROUP BY columns
+        assertQuery(
+                "SELECT regionkey, nationkey % 2 as parity, COUNT(*) FROM nation GROUP BY regionkey, nationkey % 2 ORDER BY regionkey, parity",
+                "VALUES " +
+                        "(0, 0, 3), (0, 1, 2), " +
+                        "(1, 0, 2), (1, 1, 3), " +
+                        "(2, 0, 3), (2, 1, 2), " +
+                        "(3, 0, 2), (3, 1, 3), " +
+                        "(4, 0, 3), (4, 1, 2)");
+    }
+
+    @Test
+    public void testCountStarWithHaving()
+    {
+        // COUNT(*) with GROUP BY and HAVING
+        assertQuery(
+                "SELECT regionkey, COUNT(*) as cnt FROM nation GROUP BY regionkey HAVING COUNT(*) > 4 ORDER BY regionkey",
+                "VALUES (0, 5), (1, 5), (2, 5), (3, 5), (4, 5)");
+    }
+
+    @Test
+    public void testAggregationOnTextFieldsFallsBack()
+    {
+        assertThat(query("SELECT MIN(name), MAX(name) FROM nation"))
+                .skippingTypesCheck()
+                .matches("VALUES ('ALGERIA', 'VIETNAM')")
+                .isNotFullyPushedDown(AggregationNode.class);
+
+        // COUNT on text field
+        assertQuery("SELECT COUNT(name) FROM nation", "VALUES (25)");
+
+        // MIN/MAX on text field
+        assertQuery(
+                "SELECT regionkey, MIN(name), MAX(name) FROM nation GROUP BY regionkey ORDER BY regionkey LIMIT 2",
+                "VALUES (0, 'ALGERIA', 'MOZAMBIQUE'), (1, 'ARGENTINA', 'UNITED STATES')");
+
+        // COUNT(*) and COUNT(text) together
+        assertQuery(
+                "SELECT regionkey, COUNT(*), COUNT(name) FROM nation GROUP BY regionkey ORDER BY regionkey LIMIT 2",
+                "VALUES (0, 5, 5), (1, 5, 5)");
+    }
+
+    @Test
+    public void testCountStarOnDistinctPushdown()
+            throws IOException
+    {
+        String tableName = "count_star_distinct_" + randomNameSuffix();
+        createIndex(tableName,
+                """
+                {"properties": {"k": {"type": "keyword"}}}
+                """);
+        try {
+            index(tableName, ImmutableMap.of("k", "a"));
+            index(tableName, ImmutableMap.of("k", "a"));
+            index(tableName, ImmutableMap.of("k", "b"));
+
+            assertThat(query("SELECT count(*) FROM (SELECT DISTINCT k FROM " + tableName + ")"))
+                    .matches("VALUES BIGINT '2'");
+        }
+        finally {
+            deleteIndex(tableName);
+        }
+    }
+
+    @Test
+    public void testMinMaxOnNonNumericColumns()
+            throws IOException
+    {
+        String tableName = "min_max_non_numeric_" + randomNameSuffix();
+        createIndex(tableName,
+                """
+                {"properties": {"k": {"type": "keyword"}, "b": {"type": "boolean"}}}
+                """);
+        try {
+            index(tableName, ImmutableMap.of("k", "a", "b", true));
+            index(tableName, ImmutableMap.of("k", "b", "b", false));
+
+            assertThat(query("SELECT min(k), max(k), min(b), max(b) FROM " + tableName))
+                    .matches("VALUES (VARCHAR 'a', VARCHAR 'b', false, true)")
+                    .isNotFullyPushedDown(AggregationNode.class);
+        }
+        finally {
+            deleteIndex(tableName);
+        }
+    }
+
+    @Test
+    public void testBigintMinMaxAndSumAreNotPushedDown()
+            throws IOException
+    {
+        String tableName = "bigint_aggregation_precision_" + randomNameSuffix();
+        createIndex(tableName,
+                """
+                {"properties": {"kind": {"type": "keyword"}, "value": {"type": "long"}}}
+                """);
+        try {
+            index(tableName, ImmutableMap.of("kind", "precision", "value", 9_007_199_254_740_993L));
+            index(tableName, ImmutableMap.of("kind", "precision", "value", 9_007_199_254_740_994L));
+            index(tableName, ImmutableMap.of("kind", "overflow", "value", Long.MAX_VALUE));
+            index(tableName, ImmutableMap.of("kind", "overflow", "value", 1L));
+
+            assertThat(query("SELECT MIN(value), MAX(value), SUM(value) FROM " + tableName + " WHERE kind = 'precision'"))
+                    .matches("VALUES (BIGINT '9007199254740993', BIGINT '9007199254740994', BIGINT '18014398509481987')")
+                    .isNotFullyPushedDown(AggregationNode.class);
+            assertQueryFails("SELECT SUM(value) FROM " + tableName + " WHERE kind = 'overflow'", ".*bigint addition overflow.*");
+        }
+        finally {
+            deleteIndex(tableName);
+        }
+    }
+
+    @Test
+    public void testAggregationWithMissingGroupingKeys()
+            throws IOException
+    {
+        String tableName = "test_aggregation_missing_grouping_keys_" + randomNameSuffix();
+        @Language("JSON")
+        String properties =
+                """
+                {
+                    "properties": {
+                        "group_key": {
+                            "type": "keyword"
+                        },
+                        "value": {
+                            "type": "double"
+                        }
+                    }
+                }
+                """;
+
+        createIndex(tableName, properties);
+        try {
+            index(tableName, ImmutableMap.<String, Object>builder()
+                    .put("group_key", "a")
+                    .put("value", 10.0)
+                    .buildOrThrow());
+            index(tableName, ImmutableMap.<String, Object>builder()
+                    .put("group_key", "a")
+                    .put("value", 20.0)
+                    .buildOrThrow());
+            index(tableName, ImmutableMap.<String, Object>builder()
+                    .put("group_key", "b")
+                    .put("value", 5.0)
+                    .buildOrThrow());
+            index(tableName, ImmutableMap.of("value", 7));
+            index(tableName, ImmutableMap.of("value", 8));
+
+            assertThat(query("SELECT group_key, COUNT(*), SUM(value) FROM " + tableName + " GROUP BY group_key"))
+                    .matches("VALUES (CAST(NULL AS VARCHAR), BIGINT '2', DOUBLE '15.0'), (CAST('a' AS VARCHAR), BIGINT '2', DOUBLE '30.0'), (CAST('b' AS VARCHAR), BIGINT '1', DOUBLE '5.0')")
+                    .isFullyPushedDown();
+        }
+        finally {
+            deleteIndex(tableName);
+        }
+    }
+
+    @Test
+    public void testMixedAggregationsWithEmptyInput()
+            throws IOException
+    {
+        String tableName = "mixed_aggregations_empty_input_" + randomNameSuffix();
+        createIndex(tableName,
+                """
+                {"properties": {"value": {"type": "double"}}}
+                """);
+        try {
+            index(tableName, ImmutableMap.of("value", 1.0));
+
+            assertThat(query("SELECT COUNT(*), COUNT(value), SUM(value), AVG(value), MIN(value), MAX(value) FROM " + tableName + " WHERE value < -1"))
+                    .matches("VALUES (BIGINT '0', BIGINT '0', CAST(NULL AS double), CAST(NULL AS double), CAST(NULL AS double), CAST(NULL AS double))")
+                    .isFullyPushedDown();
+        }
+        finally {
+            deleteIndex(tableName);
+        }
+    }
+
+    @Test
+    public void testMixedAggregationsWithMissingValues()
+            throws IOException
+    {
+        String tableName = "test_aggregation_missing_values_" + randomNameSuffix();
+        @Language("JSON")
+        String properties =
+                """
+                        {
+                            "properties": {
+                                "kind": {
+                                    "type": "keyword"
+                                },
+                                "value": {
+                                    "type": "double"
+                                }
+                            }
+                        }
+                        """;
+
+        createIndex(tableName, properties);
+        try {
+            index(tableName, ImmutableMap.<String, Object>builder()
+                    .put("kind", "with_value")
+                    .put("value", 10.0)
+                    .buildOrThrow());
+            index(tableName, ImmutableMap.<String, Object>builder()
+                    .put("kind", "with_value")
+                    .put("value", 20.0)
+                    .buildOrThrow());
+            index(tableName, ImmutableMap.<String, Object>builder()
+                    .put("kind", "without_value")
+                    .buildOrThrow());
+            index(tableName, ImmutableMap.<String, Object>builder()
+                    .put("kind", "without_value")
+                    .buildOrThrow());
+
+            assertThat(query("SELECT COUNT(*), COUNT(value), SUM(value), AVG(value), MIN(value), MAX(value) FROM " + tableName + " WHERE kind = 'without_value'"))
+                    .matches("VALUES (BIGINT '2', BIGINT '0', CAST(NULL AS double), CAST(NULL AS double), CAST(NULL AS double), CAST(NULL AS double))")
+                    .isFullyPushedDown();
+        }
+        finally {
+            deleteIndex(tableName);
+        }
+    }
+
+    @Test
+    @Override
     public void testShowCreateTable()
     {
         String catalogName = getSession().getCatalog().orElseThrow();
@@ -212,6 +1112,17 @@ public abstract class BaseElasticsearchConnectorTest
     public void testShowColumns()
     {
         assertThat(query("SHOW COLUMNS FROM orders")).result().matches(getDescribeOrdersResult());
+    }
+
+    private QueryRunner createAdHocQueryRunner(Map<String, String> connectorProperties)
+            throws Exception
+    {
+        return ElasticsearchQueryRunner.builder(server)
+                .addConnectorProperties(ImmutableMap.<String, String>builder()
+                        .put("jmx.base-name", randomNameSuffix())
+                        .putAll(connectorProperties)
+                        .buildOrThrow())
+                .build();
     }
 
     @Test
@@ -1960,6 +2871,102 @@ public abstract class BaseElasticsearchConnectorTest
     }
 
     @Test
+    public void testFilteredAndRoutedMultiIndexAliasPreservesScanSemantics()
+            throws IOException
+    {
+        String suffix = randomNameSuffix();
+        String firstIndex = "filtered_routed_alias_a_" + suffix;
+        String secondIndex = "filtered_routed_alias_b_" + suffix;
+        String alias = "filtered_routed_alias_" + suffix;
+        String selectedRouting = "selected-route";
+        String indexBody =
+                """
+                {
+                    "settings": {"number_of_shards": 2},
+                    "mappings": {
+                        "properties": {
+                            "tenant": {"type": "keyword"},
+                            "payload": {"type": "keyword"}
+                        }
+                    }
+                }
+                """;
+        createIndexWithBody(firstIndex, indexBody);
+        createIndexWithBody(secondIndex, indexBody);
+        try {
+            int firstSelectedShard = shardForRouting(firstIndex, selectedRouting);
+            int secondSelectedShard = shardForRouting(secondIndex, selectedRouting);
+            String otherRouting = null;
+            for (int value = 0; value < 100; value++) {
+                String candidate = "other-route-" + value;
+                if (shardForRouting(firstIndex, candidate) != firstSelectedShard
+                        && shardForRouting(secondIndex, candidate) != secondSelectedShard) {
+                    otherRouting = candidate;
+                    break;
+                }
+            }
+            if (otherRouting == null) {
+                throw new AssertionError("Could not find a routing value assigned to a different shard");
+            }
+
+            index(firstIndex, selectedRouting, ImmutableMap.of("tenant", "visible", "payload", "first-visible"));
+            index(firstIndex, selectedRouting, ImmutableMap.of("tenant", "hidden", "payload", "first-filtered"));
+            index(firstIndex, otherRouting, ImmutableMap.of("tenant", "visible", "payload", "first-routed-away"));
+            index(secondIndex, selectedRouting, ImmutableMap.of("tenant", "visible", "payload", "second-visible"));
+            index(secondIndex, selectedRouting, ImmutableMap.of("tenant", "hidden", "payload", "second-filtered"));
+            index(secondIndex, otherRouting, ImmutableMap.of("tenant", "visible", "payload", "second-routed-away"));
+
+            String aliasBody =
+                    """
+                    {
+                        "filter": {"term": {"tenant": "visible"}},
+                        "search_routing": "selected-route"
+                    }
+                    """;
+            for (String index : List.of(firstIndex, secondIndex)) {
+                Request request = new Request("PUT", format("/%s/_alias/%s", index, alias));
+                request.setJsonEntity(aliasBody);
+                client.performRequest(request);
+            }
+            refreshIndex(alias);
+
+            Session withoutPushdown = Session.builder(getSession())
+                    .setSystemProperty("allow_pushdown_into_connectors", "false")
+                    .build();
+
+            String rows = "SELECT payload FROM " + alias + " ORDER BY payload";
+            assertThat(query(rows))
+                    .matches("VALUES VARCHAR 'first-visible', VARCHAR 'second-visible'");
+            assertThat(query(withoutPushdown, rows))
+                    .matches("VALUES VARCHAR 'first-visible', VARCHAR 'second-visible'");
+
+            String topN = "SELECT payload FROM " + alias + " ORDER BY payload DESC LIMIT 1";
+            assertThat(query(topN))
+                    .matches("VALUES VARCHAR 'second-visible'");
+            assertThat(query(withoutPushdown, topN))
+                    .matches("VALUES VARCHAR 'second-visible'");
+
+            String grouping = "SELECT payload, count(*) FROM " + alias + " GROUP BY payload";
+            assertThat(query(grouping))
+                    .matches("VALUES (VARCHAR 'first-visible', BIGINT '1'), (VARCHAR 'second-visible', BIGINT '1')")
+                    .isFullyPushedDown();
+            assertThat(query(withoutPushdown, grouping))
+                    .matches("VALUES (VARCHAR 'first-visible', BIGINT '1'), (VARCHAR 'second-visible', BIGINT '1')");
+
+            String count = "SELECT count(*) FROM " + alias;
+            assertThat(query(count))
+                    .matches("VALUES BIGINT '2'")
+                    .isFullyPushedDown();
+            assertThat(query(withoutPushdown, count))
+                    .matches("VALUES BIGINT '2'");
+        }
+        finally {
+            deleteIndex(firstIndex);
+            deleteIndex(secondIndex);
+        }
+    }
+
+    @Test
     public void testSelectInformationSchemaForMultiIndexAlias()
             throws IOException
     {
@@ -2626,6 +3633,189 @@ public abstract class BaseElasticsearchConnectorTest
         assertQueryFails("SELECT * FROM " + name, ".*Table '" + catalogName + ".tpch." + name + "' does not exist");
     }
 
+    @Test
+    public void testMultiShardTopNAndTypedAggregationPagination()
+            throws Exception
+    {
+        String tableName = "multishard_pushdown_" + randomNameSuffix();
+        Request create = new Request("PUT", "/" + tableName);
+        create.setJsonEntity(
+                """
+                {
+                    "settings": {"number_of_shards": 3, "number_of_replicas": 0},
+                    "mappings": {"properties": {
+                        "id": {"type": "long"},
+                        "sort_key": {"type": "integer"},
+                        "boolean_key": {"type": "boolean"},
+                        "real_key": {"type": "float"},
+                        "bigint_key": {"type": "long"},
+                        "date_key": {"type": "date"}
+                    }}
+                }
+                """);
+        client.performRequest(create);
+        try {
+            StringBuilder documents = new StringBuilder();
+            for (int id = 0; id < 5_004; id++) {
+                Map<String, Object> document = new HashMap<>();
+                document.put("id", id);
+                document.put("real_key", (id % 4) * 0.25);
+                document.put("bigint_key", 9_007_199_254_740_993L + id % 3);
+                document.put("date_key", 1_600_000_000_000L + (id % 3) * 1_000L);
+                if (id % 7 != 0) {
+                    document.put("sort_key", id % 5);
+                    document.put("boolean_key", id % 2 == 0);
+                }
+                documents.append("{\"index\":{\"_id\":\"").append(id).append("\"}}\n")
+                        .append(new JsonMapper().writeValueAsString(document)).append('\n');
+            }
+            Request bulk = new Request("POST", "/" + tableName + "/_bulk?refresh=true");
+            bulk.setJsonEntity(documents.toString());
+            client.performRequest(bulk);
+            assertThat(computeActual("SELECT count(*) FROM " + tableName).getOnlyValue()).isEqualTo(5_004L);
+
+            Session withoutPushdown = Session.builder(getSession())
+                    .setSystemProperty("allow_pushdown_into_connectors", "false")
+                    .build();
+            for (String order : List.of("ASC NULLS FIRST", "ASC NULLS LAST", "DESC NULLS FIRST", "DESC NULLS LAST")) {
+                String sql = "SELECT id, sort_key FROM " + tableName + " ORDER BY sort_key " + order + ", id DESC LIMIT 1005";
+                assertThat(query(sql))
+                        .ordered()
+                        .matches(withoutPushdown, sql)
+                        .isNotFullyPushedDown(TopNNode.class);
+                assertExplain("EXPLAIN " + sql, "TopNPartial\\[count = 1005");
+            }
+
+            try (QueryAssertions assertions = new QueryAssertions(createAdHocQueryRunner(Map.of("elasticsearch.aggregation-page-size", "2")))) {
+                for (String key : List.of("boolean_key", "bigint_key", "date_key")) {
+                    String sql = "SELECT " + key + ", count(*) FROM " + tableName + " GROUP BY " + key;
+                    assertThat(assertions.query(sql))
+                            .matches(withoutPushdown, sql)
+                            .isFullyPushedDown();
+                }
+                String realGrouping = "SELECT real_key, count(*) FROM " + tableName + " GROUP BY real_key";
+                assertThat(assertions.query(realGrouping))
+                        .matches(withoutPushdown, realGrouping)
+                        .isNotFullyPushedDown(AggregationNode.class);
+                String sql = "SELECT boolean_key, date_key, count(*) FROM " + tableName + " GROUP BY boolean_key, date_key";
+                assertThat(assertions.query(sql))
+                        .matches(withoutPushdown, sql)
+                        .isFullyPushedDown();
+            }
+        }
+        finally {
+            deleteIndex(tableName);
+        }
+    }
+
+    @Test
+    public void testAggregationAliasesDoNotReplaceGroupingColumns()
+            throws IOException
+    {
+        String tableName = "aggregation_alias_collision_" + randomNameSuffix();
+        createIndex(tableName,
+                """
+                {"properties": {"_efgnrtd_0": {"type": "keyword"}, "__efgnrtd_0": {"type": "keyword"}}}
+                """);
+        try {
+            index(tableName, Map.of("_efgnrtd_0", "a", "__efgnrtd_0", "x"));
+            index(tableName, Map.of("_efgnrtd_0", "a", "__efgnrtd_0", "x"));
+            index(tableName, Map.of("_efgnrtd_0", "b", "__efgnrtd_0", "y"));
+            assertThat(query("SELECT _efgnrtd_0, __efgnrtd_0, count(*) FROM " + tableName + " GROUP BY _efgnrtd_0, __efgnrtd_0"))
+                    .matches("VALUES (VARCHAR 'a', VARCHAR 'x', BIGINT '2'), (VARCHAR 'b', VARCHAR 'y', BIGINT '1')")
+                    .isFullyPushedDown();
+        }
+        finally {
+            deleteIndex(tableName);
+        }
+    }
+
+    @Test
+    public void testFloatingPointTopNAndGroupingPreserveSignedZero()
+            throws IOException
+    {
+        String tableName = "floating_point_signed_zero_" + randomNameSuffix();
+        createIndex(tableName,
+                """
+                {"properties": {"id": {"type": "long"}, "d": {"type": "double"}, "r": {"type": "float"}}}
+                """);
+        try {
+            index(tableName, Map.of("id", 1, "d", -0.0, "r", -0.0));
+            index(tableName, Map.of("id", 2, "d", 0.0, "r", 0.0));
+            Session withoutPushdown = Session.builder(getSession())
+                    .setSystemProperty("allow_pushdown_into_connectors", "false")
+                    .build();
+            for (String column : List.of("d", "r")) {
+                String grouping = "SELECT count(*) FROM " + tableName + " GROUP BY " + column;
+                assertThat(query(grouping))
+                        .matches("VALUES BIGINT '2'")
+                        .isNotFullyPushedDown(AggregationNode.class);
+                assertThat(query(withoutPushdown, grouping)).matches("VALUES BIGINT '2'");
+
+                String ascending = "SELECT id FROM " + tableName + " ORDER BY " + column + " ASC, id DESC LIMIT 1";
+                assertThat(query(ascending))
+                        .matches("VALUES BIGINT '2'")
+                        .isNotFullyPushedDown(TopNNode.class);
+                assertThat(query(withoutPushdown, ascending)).matches("VALUES BIGINT '2'");
+
+                String descending = "SELECT id FROM " + tableName + " ORDER BY " + column + " DESC, id ASC LIMIT 1";
+                assertThat(query(descending))
+                        .matches("VALUES BIGINT '1'")
+                        .isNotFullyPushedDown(TopNNode.class);
+                assertThat(query(withoutPushdown, descending)).matches("VALUES BIGINT '1'");
+
+                for (String predicate : List.of("= 0.0", ">= 0.0", "<= 0.0", ">= -0.0", "<= -0.0")) {
+                    String predicateQuery = "SELECT id FROM " + tableName + " WHERE " + column + " " + predicate;
+                    assertThat(query(predicateQuery))
+                            .matches("VALUES BIGINT '1', BIGINT '2'")
+                            .isNotFullyPushedDown(FilterNode.class);
+                    assertThat(query(withoutPushdown, predicateQuery)).matches("VALUES BIGINT '1', BIGINT '2'");
+                }
+                for (String predicate : List.of("> 0.0", "< 0.0", "> -0.0", "< -0.0")) {
+                    String predicateQuery = "SELECT id FROM " + tableName + " WHERE " + column + " " + predicate;
+                    assertThat(query(predicateQuery))
+                            .matches("SELECT CAST(NULL AS BIGINT) WHERE false")
+                            .isNotFullyPushedDown(FilterNode.class);
+                    assertThat(query(withoutPushdown, predicateQuery)).matches("SELECT CAST(NULL AS BIGINT) WHERE false");
+                }
+
+                assertThat(query("SELECT id FROM " + tableName + " WHERE " + column + " < 1.0"))
+                        .matches("VALUES BIGINT '1', BIGINT '2'")
+                        .isFullyPushedDown();
+            }
+        }
+        finally {
+            deleteIndex(tableName);
+        }
+    }
+
+    @Test
+    public void testFloatingPointAggregationOverflow()
+            throws IOException
+    {
+        String tableName = "floating_point_aggregation_overflow_" + randomNameSuffix();
+        createIndex(tableName,
+                """
+                {"properties": {"group_key": {"type": "keyword"}, "value": {"type": "double"}}}
+                """);
+        try {
+            for (String group : List.of("positive", "negative")) {
+                double value = group.equals("positive") ? Double.MAX_VALUE : -Double.MAX_VALUE;
+                index(tableName, Map.of("group_key", group, "value", value));
+                index(tableName, Map.of("group_key", group, "value", value));
+            }
+            assertThat(query("SELECT group_key, SUM(value), AVG(value) FROM " + tableName + " GROUP BY group_key"))
+                    .matches("VALUES (VARCHAR 'positive', infinity(), infinity()), (VARCHAR 'negative', -infinity(), -infinity())")
+                    .isFullyPushedDown();
+            assertThat(query("SELECT SUM(value), AVG(value) FROM " + tableName + " WHERE group_key = 'positive'"))
+                    .matches("VALUES (infinity(), infinity())")
+                    .isFullyPushedDown();
+        }
+        finally {
+            deleteIndex(tableName);
+        }
+    }
+
     protected String indexEndpoint(String index, String docId)
     {
         return format("/%s/_doc/%s", index, docId);
@@ -2641,6 +3831,25 @@ public abstract class BaseElasticsearchConnectorTest
         request.setJsonEntity(json);
 
         client.performRequest(request);
+    }
+
+    private void index(String index, String routing, Map<String, Object> document)
+            throws IOException
+    {
+        String json = new JsonMapper().writeValueAsString(document);
+        String endpoint = format("%s?routing=%s&refresh", indexEndpoint(index, String.valueOf(System.nanoTime())), routing);
+
+        Request request = new Request("PUT", endpoint);
+        request.setJsonEntity(json);
+        client.performRequest(request);
+    }
+
+    private int shardForRouting(String index, String routing)
+            throws IOException
+    {
+        Request request = new Request("GET", format("/%s/_search_shards?routing=%s", index, routing));
+        JsonNode response = new JsonMapper().readTree(client.performRequest(request).getEntity().getContent());
+        return response.path("shards").get(0).get(0).path("shard").asInt();
     }
 
     private void addAlias(String index, String alias)
@@ -2661,6 +3870,14 @@ public abstract class BaseElasticsearchConnectorTest
             throws IOException
     {
         client.performRequest(new Request("PUT", "/" + indexName));
+    }
+
+    private void createIndexWithBody(String indexName, @Language("JSON") String body)
+            throws IOException
+    {
+        Request request = new Request("PUT", "/" + indexName);
+        request.setJsonEntity(body);
+        client.performRequest(request);
     }
 
     private void createIndex(String indexName, @Language("JSON") String properties)
